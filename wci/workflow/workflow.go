@@ -122,6 +122,7 @@ func (d *WorkflowRunner) run(ctx workflow.Context) error {
 			ConflictToken:        d.State.ConflictToken,
 			CreateTime:           d.State.CreateTime,
 			LastModifierIdentity: d.State.LastModifierIdentity,
+			ValidationState:      d.State.ValidationState,
 		}, nil
 	}); err != nil {
 		return err
@@ -258,7 +259,14 @@ func (d *WorkflowRunner) handleUpdateInstance(ctx workflow.Context, args *iface.
 			return &iface.UpdateWorkerControllerInstanceResponse{Spec: d.State.Spec}, nil
 		}
 
+		validationTime := workflow.Now(ctx)
+
 		if err := updatedSpec.Validate(); err != nil {
+			d.State.ValidationState = &iface.ValidationState{
+				LastValidatedTime: timestamppb.New(validationTime),
+				Status:            iface.ValidationStatusFailed,
+				ErrMessage:        err.Error(),
+			}
 			return nil, serviceerror.NewInvalidArgumentf("%w", err)
 		}
 
@@ -268,11 +276,19 @@ func (d *WorkflowRunner) handleUpdateInstance(ctx workflow.Context, args *iface.
 			&ValidateSpecRequest{Spec: updatedSpec},
 		).Get(ctx, nil); err != nil {
 			var appErr *temporal.ApplicationError
+			errMsg := err.Error()
+			if errors.As(err, &appErr) {
+				errMsg = appErr.Message()
+			}
+			d.State.ValidationState = &iface.ValidationState{
+				LastValidatedTime: timestamppb.New(validationTime),
+				Status:            iface.ValidationStatusFailed,
+				ErrMessage:        errMsg,
+			}
 			if errors.As(err, &appErr) {
 				return nil, serviceerror.NewInvalidArgumentf("%s", appErr.Message())
-			} else {
-				return nil, err
 			}
+			return nil, err
 		}
 
 		// we need to scale up each of the groups for a moment to get them to register the task queues
@@ -282,15 +298,28 @@ func (d *WorkflowRunner) handleUpdateInstance(ctx workflow.Context, args *iface.
 			updatedSpec,
 		).Get(ctx, nil); err != nil {
 			var appErr *temporal.ApplicationError
+			errMsg := err.Error()
+			if errors.As(err, &appErr) {
+				errMsg = appErr.Message()
+			}
+			d.State.ValidationState = &iface.ValidationState{
+				LastValidatedTime: timestamppb.New(validationTime),
+				Status:            iface.ValidationStatusFailed,
+				ErrMessage:        errMsg,
+			}
 			if errors.As(err, &appErr) {
 				if appErr.Type() == "InvalidArgument" {
 					return nil, serviceerror.NewInvalidArgumentf("%s", appErr.Message())
 				} else {
 					return nil, serviceerror.NewFailedPreconditionf("%s", appErr.Message())
 				}
-			} else {
-				return nil, err
 			}
+			return nil, err
+		}
+
+		d.State.ValidationState = &iface.ValidationState{
+			LastValidatedTime: timestamppb.New(validationTime),
+			Status:            iface.ValidationStatusSuccess,
 		}
 
 		d.State.ConflictToken = args.ConflictToken
@@ -428,6 +457,11 @@ func (d *WorkflowRunner) handleActions(ctx workflow.Context, actions []scalingal
 				},
 			).Get(ctx, nil); err != nil {
 				d.logger.Warn("Failed to execute new worker instance activity", "namespace", d.NamespaceName, "deployment_name", d.DeploymentName, "error", err)
+				d.State.ValidationState = &iface.ValidationState{
+					LastValidatedTime: timestamppb.New(workflow.Now(ctx)),
+					Status:            iface.ValidationStatusFailed,
+					ErrMessage:        err.Error(),
+				}
 			}
 		case scalingalgorithm.ActionTypeUpdateWorkerSetSize:
 			if err := workflow.ExecuteActivity(
@@ -439,6 +473,11 @@ func (d *WorkflowRunner) handleActions(ctx workflow.Context, actions []scalingal
 				},
 			).Get(ctx, nil); err != nil {
 				d.logger.Warn("Failed to execute update worker-set size activity", "namespace", d.NamespaceName, "deployment_name", d.DeploymentName, "error", err)
+				d.State.ValidationState = &iface.ValidationState{
+					LastValidatedTime: timestamppb.New(workflow.Now(ctx)),
+					Status:            iface.ValidationStatusFailed,
+					ErrMessage:        err.Error(),
+				}
 			}
 		default:
 			d.logger.Warn("Unknown scaling action", "action", action.Action)
